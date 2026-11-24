@@ -10,14 +10,21 @@
 #include "hal.h"
 #include "mqtt.h"
 #include "ringbuf.h"
+#include "store.h"
 
 #define RB_CAP (64u * 1024u)
+#define RECONNECT_SEC 3
 
 static uint8_t   g_mem[RB_CAP];
 static ringbuf_t g_rb;
 static hal_t    *g_hal;
 static mqtt_client_t *g_mqtt = NULL;
+static store_t       *g_store = NULL;
 static const char    *g_topic = "gw/data";
+static const char    *g_broker = NULL;
+static const char    *g_client_id = "imx6ull-gw";
+static time_t         g_last_try = 0;
+static int            g_offline = 0;
 static volatile sig_atomic_t g_run = 1;
 
 static void on_signal(int sig)
@@ -35,10 +42,80 @@ static void sleep_ms(long ms)
     nanosleep(&ts, NULL);
 }
 
-/* 收到云端下发的指令（阶段 2 只是打印，阶段 3 接执行逻辑） */
+/* 收到云端下发的指令（阶段 2 只是打印） */
 static void on_remote_cmd(const char *topic, const uint8_t *payload, size_t len)
 {
     printf("[cmd] %s -> %.*s\n", topic, (int)len, (const char *)payload);
+}
+
+/* 断线后每 3 秒重试一次 */
+static void maybe_reconnect(void)
+{
+    time_t now;
+
+    if (g_mqtt != NULL || g_broker == NULL) {
+        return;
+    }
+    now = time(NULL);
+    if (now - g_last_try < RECONNECT_SEC) {
+        return;
+    }
+    g_last_try = now;
+
+    g_mqtt = mqtt_create();
+    if (g_mqtt != NULL && mqtt_connect(g_mqtt, g_broker, 1883, g_client_id, 60) == 0) {
+        mqtt_set_callback(g_mqtt, on_remote_cmd);
+        fprintf(stderr, "[mqtt] 已连接 %s:1883\n", g_broker);
+        if (g_offline) {
+            fprintf(stderr, "[mqtt] 恢复在线，开始补发积压数据\n");
+            g_offline = 0;
+        }
+    } else {
+        mqtt_destroy(g_mqtt);
+        g_mqtt = NULL;
+    }
+}
+
+/* 在线就直接发，离线或失败就落盘 */
+static void publish_or_store(const char *payload, size_t len)
+{
+    if (g_mqtt != NULL) {
+        if (mqtt_publish(g_mqtt, g_topic, payload, len) == 0) {
+            return;
+        }
+        fprintf(stderr, "[mqtt] 发送失败，转入离线缓存\n");
+        mqtt_destroy(g_mqtt);
+        g_mqtt = NULL;
+    }
+
+    if (g_store != NULL && store_append(g_store, payload, len) != 0) {
+        fprintf(stderr, "[store] 写入失败\n");
+    } else if (!g_offline) {
+        fprintf(stderr, "[store] 离线中，数据改为写入本地缓存\n");
+        g_offline = 1;
+    }
+}
+
+/* 每次最多补发 20 条，避免长时间占用处理线程 */
+static void drain_store(void)
+{
+    uint8_t buf[256];
+    int budget = 20;
+
+    while (budget-- > 0 && g_mqtt != NULL && g_store != NULL) {
+        size_t n = 0;
+        int r = store_peek(g_store, buf, sizeof(buf), &n);
+
+        if (r <= 0) {
+            break;
+        }
+        if (mqtt_publish(g_mqtt, g_topic, buf, n) != 0) {
+            mqtt_destroy(g_mqtt);
+            g_mqtt = NULL;
+            break;
+        }
+        store_advance(g_store);
+    }
 }
 
 /* 采集线程：设备 -> 环形缓冲 */
@@ -67,7 +144,7 @@ static void *producer(void *arg)
                 off   += w;
                 bytes += w;
                 if (w == 0) {
-                    sleep_ms(1);   /* 缓冲满，让出 CPU */
+                    sleep_ms(1);
                 }
             }
         }
@@ -77,7 +154,7 @@ static void *producer(void *arg)
     return NULL;
 }
 
-/* 处理线程：环形缓冲 -> 解帧 -> 上报 MQTT */
+/* 处理线程：环形缓冲 -> 解帧 -> 上报（离线则落盘） */
 static void *consumer(void *arg)
 {
     uint8_t buf[256];
@@ -92,6 +169,8 @@ static void *consumer(void *arg)
     while (g_run) {
         size_t n;
 
+        maybe_reconnect();
+
         if (g_mqtt != NULL) {
             int r = mqtt_poll(g_mqtt, 0);
             if (r < 0) {
@@ -100,6 +179,7 @@ static void *consumer(void *arg)
                 g_mqtt = NULL;
             } else {
                 mqtt_keepalive(g_mqtt);
+                drain_store();      /* 先把积压补完，再发新数据 */
             }
         }
 
@@ -112,29 +192,22 @@ static void *consumer(void *arg)
         {
             size_t i;
             for (i = 0; i < n; i++) {
+                char json[160];
+                int  jn;
+
                 if (!frame_parser_feed(&fp, &buf[i], 1, &f)) {
                     continue;
                 }
-
                 frames++;
 
-                if (g_mqtt != NULL) {
-                    char json[160];
-                    int  jn = snprintf(json, sizeof(json),
-                                       "{\"seq\":%u,\"temp\":%.1f,\"hum\":%.1f,\"volt\":%.2f}",
-                                       (unsigned)f.seq,
-                                       (double)f.temp / 10.0,
-                                       (double)f.hum / 10.0,
-                                       (double)f.volt / 1000.0);
-                    if (jn > 0 && mqtt_publish(g_mqtt, g_topic, json, (size_t)jn) != 0) {
-                        fprintf(stderr, "[mqtt] 发布失败\n");
-                    }
-                } else {
-                    printf("[rx] seq=%-5u temp=%5.1fC hum=%5.1f%% volt=%.2fV\n",
-                           (unsigned)f.seq,
-                           (double)f.temp / 10.0,
-                           (double)f.hum / 10.0,
-                           (double)f.volt / 1000.0);
+                jn = snprintf(json, sizeof(json),
+                              "{\"seq\":%u,\"temp\":%.1f,\"hum\":%.1f,\"volt\":%.2f}",
+                              (unsigned)f.seq,
+                              (double)f.temp / 10.0,
+                              (double)f.hum / 10.0,
+                              (double)f.volt / 1000.0);
+                if (jn > 0) {
+                    publish_or_store(json, (size_t)jn);
                 }
             }
         }
@@ -146,11 +219,11 @@ static void *consumer(void *arg)
 
 int main(int argc, char **argv)
 {
-    const char *mode   = (argc > 1) ? argv[1] : "sim";
-    const char *dev    = NULL;
-    const char *broker = (argc > 2) ? argv[2] : NULL;
+    const char *mode = (argc > 1) ? argv[1] : "sim";
+    const char *dev  = NULL;
     pthread_t tp, tc;
 
+    g_broker = (argc > 2) ? argv[2] : NULL;
     if (argc > 3) {
         g_topic = argv[3];
     }
@@ -158,16 +231,19 @@ int main(int argc, char **argv)
         dev = argv[4];
     }
 
-    if (broker != NULL) {
-        g_mqtt = mqtt_create();
-        if (g_mqtt != NULL && mqtt_connect(g_mqtt, broker, 1883, "imx6ull-gw", 60) == 0) {
-            mqtt_set_callback(g_mqtt, on_remote_cmd);
-            fprintf(stderr, "[main] 已连接 MQTT %s:1883，主题 %s\n", broker, g_topic);
-        } else {
-            fprintf(stderr, "[main] MQTT 连接失败，改为只打印\n");
-            mqtt_destroy(g_mqtt);
-            g_mqtt = NULL;
+    g_store = store_create("queue");
+    if (g_store == NULL) {
+        fprintf(stderr, "[main] 离线缓存目录创建失败，断网数据将丢失\n");
+    } else {
+        uint8_t tmp[256];
+        size_t n = 0;
+        if (store_peek(g_store, tmp, sizeof(tmp), &n) == 1) {
+            fprintf(stderr, "[main] 发现上次未补发的数据，将优先发送\n");
         }
+    }
+
+    if (g_broker != NULL) {
+        maybe_reconnect();
     }
 
     if (strcmp(mode, "uart") == 0) {
@@ -177,18 +253,21 @@ int main(int argc, char **argv)
     }
     if (g_hal == NULL) {
         fprintf(stderr, "创建 hal 失败\n");
+        store_destroy(g_store);
         return 1;
     }
     if (g_hal->open(g_hal, dev) != 0) {
         fprintf(stderr, "打开设备失败: %s\n", mode);
         g_hal->close(g_hal);
         mqtt_destroy(g_mqtt);
+        store_destroy(g_store);
         return 1;
     }
     if (rb_init(&g_rb, g_mem, RB_CAP) != 0) {
         fprintf(stderr, "环形缓冲初始化失败\n");
         g_hal->close(g_hal);
         mqtt_destroy(g_mqtt);
+        store_destroy(g_store);
         return 1;
     }
 
@@ -199,6 +278,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "创建采集线程失败\n");
         g_hal->close(g_hal);
         mqtt_destroy(g_mqtt);
+        store_destroy(g_store);
         return 1;
     }
     if (pthread_create(&tc, NULL, consumer, NULL) != 0) {
@@ -207,6 +287,7 @@ int main(int argc, char **argv)
         pthread_join(tp, NULL);
         g_hal->close(g_hal);
         mqtt_destroy(g_mqtt);
+        store_destroy(g_store);
         return 1;
     }
 
@@ -219,6 +300,7 @@ int main(int argc, char **argv)
     pthread_join(tp, NULL);
     pthread_join(tc, NULL);
     mqtt_destroy(g_mqtt);
+    store_destroy(g_store);
     g_hal->close(g_hal);
     return 0;
 }
