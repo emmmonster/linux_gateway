@@ -5,10 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "frame.h"
 #include "hal.h"
 #include "mqtt.h"
+#include "ota.h"
 #include "ringbuf.h"
 #include "store.h"
 
@@ -40,6 +42,18 @@ static void sleep_ms(long ms)
     ts.tv_sec  = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+
+/* 打印自己是从哪个路径启动的，用来确认 OTA 切换是否生效 */
+static void print_self_path(void)
+{
+    char buf[256];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+
+    if (n > 0) {
+        buf[n] = '\0';
+        fprintf(stderr, "[main] 运行位置 %s\n", buf);
+    }
 }
 
 /* 收到云端下发的指令（阶段 2 只是打印） */
@@ -224,6 +238,27 @@ int main(int argc, char **argv)
     pthread_t tp, tc;
 
     g_broker = (argc > 2) ? argv[2] : NULL;
+
+    /* OTA 单次任务模式：gateway ota <url> <sha256> */
+    if (strcmp(mode, "ota") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "用法: %s ota <url> <sha256>\n", argv[0]);
+            return 1;
+        }
+        return (ota_run(argv[2], argv[3]) == 0) ? 0 : 1;
+    }
+
+    /* 安装模式：gateway install <升级包> <版本号> */
+    if (strcmp(mode, "install") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "用法: %s install <升级包> <版本号>\n", argv[0]);
+            return 1;
+        }
+        return (ota_install(argv[2], argv[3]) == 0) ? 0 : 1;
+    }
+
+    print_self_path();
+
     if (argc > 3) {
         g_topic = argv[3];
     }

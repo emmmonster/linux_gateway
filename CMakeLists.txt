@@ -24,6 +24,9 @@ add_executable(gateway
     src/hal_uart.c
     src/mqtt.c
     src/store.c
+    src/sha256.c
+    src/http.c
+    src/ota.c
 )
 target_link_libraries(gateway PRIVATE core Threads::Threads)
 target_compile_options(gateway PRIVATE -Wall -Wextra)
