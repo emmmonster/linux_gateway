@@ -259,6 +259,12 @@ int main(int argc, char **argv)
 
     print_self_path();
 
+    /* 上一次升级没确认成功的话，这里会把 current 切回旧版本 */
+    if (ota_boot_check() != 0) {
+        fprintf(stderr, "[main] 已回滚，退出等待守护进程拉起旧版本\n");
+        return 0;
+    }
+
     if (argc > 3) {
         g_topic = argv[3];
     }
@@ -328,8 +334,16 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[main] 已启动 (mode=%s)，Ctrl-C 退出\n", mode);
 
-    while (g_run) {
-        sleep_ms(100);
+    {
+        time_t boot = time(NULL);
+
+        while (g_run) {
+            sleep_ms(100);
+            if (boot != 0 && time(NULL) - boot >= 10) {
+                ota_confirm();      /* 跑满 10 秒算健康，确认升级 */
+                boot = 0;
+            }
+        }
     }
 
     pthread_join(tp, NULL);

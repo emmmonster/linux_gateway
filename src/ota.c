@@ -121,15 +121,81 @@ done:
     return ret;
 }
 
+/* 从 /proc/self/exe 解析当前版本目录名：app/v2/gateway -> v2 */
+static int ota_current_version(char *out, size_t cap)
+{
+    char path[320];
+    char *slash;
+    char *prev;
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+
+    if (n <= 0) {
+        return -1;
+    }
+    path[n] = '\0';
+
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        return -1;
+    }
+    *slash = '\0';
+
+    prev = strrchr(path, '/');
+    if (prev == NULL) {
+        return -1;
+    }
+    prev++;
+
+    if (strlen(prev) >= cap) {
+        return -1;
+    }
+    snprintf(out, cap, "%s", prev);
+    return 0;
+}
+
+/* 读 app/current 指向的版本名 */
+static int read_current(char *out, size_t cap)
+{
+    ssize_t n;
+
+    if (cap < 2) {
+        return -1;
+    }
+    n = readlink("app/current", out, cap - 1);
+    if (n <= 0) {
+        return -1;
+    }
+    out[n] = '\0';
+    return 0;
+}
+
+static int write_pending(const char *newv, const char *oldv)
+{
+    FILE *fp = fopen("app/pending", "w");
+
+    if (fp == NULL) {
+        return -1;
+    }
+    fprintf(fp, "%s %s\n", newv, oldv);
+    fclose(fp);
+    return 0;
+}
+
 int ota_install(const char *pkg_path, const char *version)
 {
     char dir[160];
     char target[192];
     char link_tmp[160];
+    char old_ver[64];
 
     if (pkg_path == NULL || !valid_version(version)) {
         fprintf(stderr, "[ota] 版本名不合法\n");
         return -1;
+    }
+
+    old_ver[0] = '\0';
+    if (read_current(old_ver, sizeof(old_ver)) != 0) {
+        snprintf(old_ver, sizeof(old_ver), "%s", version);
     }
 
     (void)mkdir("app", 0755);
@@ -139,6 +205,12 @@ int ota_install(const char *pkg_path, const char *version)
     snprintf(target, sizeof(target), "%s/gateway", dir);
     if (copy_file(pkg_path, target, 0755) != 0) {
         fprintf(stderr, "[ota] 写入新版本失败\n");
+        return -1;
+    }
+
+    /* 先记下待验证的版本对，回滚时要用 */
+    if (write_pending(version, old_ver) != 0) {
+        fprintf(stderr, "[ota] 写升级标记失败\n");
         return -1;
     }
 
@@ -159,7 +231,70 @@ int ota_install(const char *pkg_path, const char *version)
     }
 
     printf("[ota] 已安装到 %s\n", target);
-    printf("[ota] app/current -> %s\n", version);
+    printf("[ota] app/current -> %s（旧版本 %s）\n", version, old_ver);
     printf("[ota] 重启后生效：./app/current/gateway sim localhost\n");
     return 0;
+}
+
+int ota_boot_check(void)
+{
+    char cur[64];
+    char newv[64];
+    char oldv[64];
+    char tmp[96];
+    FILE *fp;
+
+    if (ota_current_version(cur, sizeof(cur)) != 0) {
+        return 0;                       /* 不在 app/ 下运行，跳过 */
+    }
+
+    fp = fopen("app/pending", "r");
+    if (fp == NULL) {
+        return 0;                       /* 没有待验证的升级 */
+    }
+    if (fscanf(fp, "%63s %63s", newv, oldv) != 2) {
+        fclose(fp);
+        (void)unlink("app/pending");
+        return 0;
+    }
+    fclose(fp);
+
+    if (strcmp(cur, newv) != 0) {
+        (void)unlink("app/pending");    /* 跑的不是新版本，标记作废 */
+        return 0;
+    }
+
+    if (access("app/attempted", F_OK) == 0) {
+        /* 第二次启动还没确认，说明上次没跑起来，回滚 */
+        fprintf(stderr, "[ota] 新版本 %s 启动后未确认，回滚到 %s\n", newv, oldv);
+
+        snprintf(tmp, sizeof(tmp), "app/.rollback.%d", (int)getpid());
+        (void)unlink(tmp);
+        if (symlink(oldv, tmp) == 0 && rename(tmp, "app/current") == 0) {
+            (void)unlink("app/pending");
+            (void)unlink("app/attempted");
+            fprintf(stderr, "[ota] 已回滚，重启后将运行 %s\n", oldv);
+            return 1;
+        }
+        (void)unlink(tmp);
+        return 0;
+    }
+
+    fp = fopen("app/attempted", "w");
+    if (fp != NULL) {
+        fputs("1\n", fp);
+        fclose(fp);
+    }
+    fprintf(stderr, "[ota] 首次启动 %s，等待确认\n", cur);
+    return 0;
+}
+
+void ota_confirm(void)
+{
+    if (access("app/pending", F_OK) != 0) {
+        return;
+    }
+    (void)unlink("app/pending");
+    (void)unlink("app/attempted");
+    fprintf(stderr, "[ota] 新版本运行正常，升级已确认\n");
 }

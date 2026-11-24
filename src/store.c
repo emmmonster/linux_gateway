@@ -97,7 +97,9 @@ static uint32_t scan_segment(int fd, uint32_t *count)
     }
 
     if (off < (uint32_t)size) {          /* 截掉断电留下的半条 */
-        (void)ftruncate(fd, (off_t)off);
+        if (ftruncate(fd, (off_t)off) != 0) {
+            fprintf(stderr, "[store] 截断尾部失败\n");
+        }
     }
     if (count != NULL) {
         *count = cnt;

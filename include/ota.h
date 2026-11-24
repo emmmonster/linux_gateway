@@ -16,4 +16,13 @@ int ota_run(const char *url, const char *expect_sha256);
  */
 int ota_install(const char *pkg_path, const char *version);
 
+/*
+ * 启动时调用：检查是否有未确认的升级。
+ * 返回 1 表示已经回滚，调用方应退出，让外层守护重新拉起旧版本。
+ */
+int  ota_boot_check(void);
+
+/* 运行健康后调用，确认升级成功，清掉 pending 标记 */
+void ota_confirm(void);
+
 #endif /* OTA_H */
